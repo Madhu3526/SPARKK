@@ -1,36 +1,39 @@
 """
-Tamil Speech → ISL (Indian Sign Language) Gloss Pipeline
-=========================================================
 Requirements:
-    pip install sounddevice scipy elevenlabs stanza openai
-
-Usage:
-    python tamil_to_isl.py
+    pip install sounddevice scipy elevenlabs stanza langchain langchain-openai langchain-core
 """
 
+import json
+import os
 import sounddevice as sd
 from scipy.io.wavfile import write
 from elevenlabs.client import ElevenLabs
 import stanza
-import openai
-import json
-import os
-import os
-from dotenv import load_dotenv
-from openai import OpenAI
 
-load_dotenv()
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+from langchain_core.messages import HumanMessage
+from pydantic import BaseModel, Field
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY")
-DURATION    = 5     
+
+SAMPLE_RATE = 16000
+DURATION    = 5
 AUDIO_FILE  = "recorded.wav"
 
 KEEP_UPOS = {"NOUN", "VERB", "ADJ", "ADV", "PROPN", "NUM"}
 
+class ISLOutput(BaseModel):
+    isl_gloss: str = Field(description="ISL gloss in CAPITAL-HYPHENATED form e.g. BOY SCHOOL GO")
+    english_gloss: str = Field(description="English equivalent of the ISL gloss")
+    dropped_words: list[str] = Field(description="Words removed as function words")
+    explanation: str = Field(description="One sentence explaining the grammar transformation")
 
 def record_audio(duration: int = DURATION, sample_rate: int = SAMPLE_RATE) -> str:
-    print(f"\n Recording for {duration} seconds... Speak now in Tamil!")
+    print(f"\nRecording for {duration} seconds... Speak now in Tamil!")
     audio = sd.rec(
         int(duration * sample_rate),
         samplerate=sample_rate,
@@ -49,151 +52,187 @@ def speech_to_text(audio_path: str) -> str:
         transcription = client.speech_to_text.convert(
             file=f,
             model_id="scribe_v1",
-            language_code="ta" 
         )
     tamil_text = transcription.text.strip()
-    print(f"Transcribed Tamil: {tamil_text}")
+    print(f"Transcribed: {tamil_text}")
     return tamil_text
 
-
 def load_stanza_pipeline() -> stanza.Pipeline:
-    print("\noading Stanza Tamil NLP pipeline...")
+    print("\nLoading Stanza Tamil pipeline...")
     try:
         nlp = stanza.Pipeline("ta", processors="tokenize,pos", verbose=False)
     except Exception:
-        print("   Tamil model not found — downloading (one-time)...")
+        print("   Downloading Tamil model (one-time)...")
         stanza.download("ta")
         nlp = stanza.Pipeline("ta", processors="tokenize,pos", verbose=False)
-    print("Stanza pipeline ready.")
+    print("Stanza ready.")
     return nlp
 
 
-def tokenize_and_tag(nlp: stanza.Pipeline, text: str) -> list[dict]:
+def tokenize_and_tag(nlp: stanza.Pipeline, text: str) -> dict:
     doc = nlp(text)
-    tokens = []
+    all_tokens = []
+    content_tokens = []
+
     for sentence in doc.sentences:
         for word in sentence.words:
-            tokens.append({
+            token = {
                 "word": word.text,
                 "lemma": word.lemma or word.text,
                 "upos": word.upos,
-                "keep": word.upos in KEEP_UPOS,
-            })
+            }
+            all_tokens.append(token)
+            if word.upos in KEEP_UPOS:
+                content_tokens.append(token)
+
     print("\nPOS-tagged tokens:")
-    for t in tokens:
-        marker = "✓" if t["keep"] else "✗"
+    for t in all_tokens:
+        marker = "✓" if t in content_tokens else "✗"
         print(f"   {marker}  {t['word']:<20} [{t['upos']}]")
-    return tokens
+
+    return {
+        "all_tokens": all_tokens,
+        "content_tokens": content_tokens,
+    }
 
 
-def build_llm_prompt(tokens: list[dict], original_text: str) -> str:
-    # Only pass kept tokens to the LLM to reduce noise
-    content_words = [
-        f"{t['word']} ({t['upos']})"
-        for t in tokens if t["keep"]
-    ]
-    return f"""You are an expert in Indian Sign Language (ISL) linguistics.
+def build_isl_chain(llm: ChatOpenAI):
+    """
+    LangChain LCEL chain:
+        input dict → prompt → LLM → JsonOutputParser → ISLOutput
+    """
+    parser = JsonOutputParser(pydantic_object=ISLOutput)
 
-Original Tamil sentence:
-"{original_text}"
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are an expert linguist in Indian Sign Language (ISL) and Tamil.
+Your job is to convert Tamil text into ISL gloss following strict rules.
 
-Content-word tokens extracted (already filtered by POS):
-{', '.join(content_words)}
+ISL Grammar Rules:
+- Word order: Subject-Object-Verb (SOV)
+- Drop all function words: postpositions, auxiliaries, particles, conjunctions, articles
+- Use dictionary/root form of each content word
+- Write gloss in CAPITAL LETTERS, hyphen-separated
+- ISL is visual — keep only the words that carry meaning
 
-Task: Convert to ISL gloss following these rules:
-1. ISL uses Subject-Object-Verb (SOV) word order.
-2. Keep only meaningful content words (nouns, verbs, adjectives, numbers, proper nouns).
-3. Drop all function words: postpositions, auxiliaries, particles, conjunctions.
-4. Use the ROOT / dictionary form of each word (do not inflect).
-5. Write the gloss in CAPITAL LETTERS, words separated by hyphens.
-6. Also provide a short English gloss for reference.
+{format_instructions}"""),
+        ("human", """Tamil sentence: "{tamil_text}"
 
-Respond ONLY with valid JSON (no markdown, no extra text):
-{{
-  "isl_gloss": "WORD1-WORD2-WORD3",
-  "english_gloss": "english equivalent gloss",
-  "explanation": "one sentence explaining the grammar change"
-}}"""
+Content-word tokens (POS-filtered):
+{content_words}
 
+Convert to ISL gloss.""")
+    ])
 
-def grammar_shift_to_isl(tokens: list[dict], original_text: str) -> dict:
-    print("\nSending to LLM for ISL grammar conversion...")
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
-    prompt = build_llm_prompt(tokens, original_text)
-
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=300,
+    chain = (
+        RunnablePassthrough.assign(
+            format_instructions=lambda _: parser.get_format_instructions()
+        )
+        | prompt
+        | llm
+        | parser
     )
 
-    raw = response.choices[0].message.content.strip()
+    return chain
 
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
 
-    result = json.loads(raw)
-    return result
 
-def display_result(tamil_text: str, tokens: list[dict], isl_result: dict) -> None:
-    print("\n" + "═" * 55)
+def build_full_pipeline(nlp: stanza.Pipeline, isl_chain):
+    """
+        tamil_text → tag → format → isl_chain → result
+    """
+
+    def tag_and_format(tamil_text: str) -> dict:
+        tagged = tokenize_and_tag(nlp, tamil_text)
+        content_words_str = ", ".join(
+            f"{t['word']} ({t['upos']})" for t in tagged["content_tokens"]
+        )
+        return {
+            "tamil_text": tamil_text,
+            "content_words": content_words_str,
+            "all_tokens": tagged["all_tokens"],
+            "content_tokens": tagged["content_tokens"],
+        }
+
+    def run_isl_chain(data: dict) -> dict:
+        print("\nRunning LangChain ISL conversion chain...")
+        result = isl_chain.invoke({
+            "tamil_text": data["tamil_text"],
+            "content_words": data["content_words"],
+        })
+        return {**data, "isl_result": result}
+
+    pipeline = (
+        RunnableLambda(tag_and_format)
+        | RunnableLambda(run_isl_chain)
+    )
+
+    return pipeline
+
+
+def display_result(data: dict) -> None:
+    r = data["isl_result"]
+    print("\n" + "═" * 58)
     print("  TAMIL → ISL CONVERSION RESULT")
-    print("═" * 55)
-    print(f"  Tamil input   : {tamil_text}")
-    print(f"  ISL gloss     : {isl_result.get('isl_gloss', 'N/A')}")
-    print(f"  English gloss : {isl_result.get('english_gloss', 'N/A')}")
-    print(f"  Note          : {isl_result.get('explanation', '')}")
-    print("═" * 55)
+    print("═" * 58)
+    print(f"  Tamil input    : {data['tamil_text']}")
+    print(f"  ISL gloss      : {r.get('isl_gloss', 'N/A')}")
+    print(f"  English gloss  : {r.get('english_gloss', 'N/A')}")
+    print(f"  Dropped words  : {', '.join(r.get('dropped_words', []))}")
+    print(f"  Note           : {r.get('explanation', '')}")
+    print("═" * 58)
 
 
 def main():
-    # Load Stanza once (reusable across multiple sentences)
     nlp = load_stanza_pipeline()
 
+    llm = ChatOpenAI(
+        model="gpt-4o",
+        temperature=0.2,
+        api_key=OPENAI_API_KEY,
+    )
+
+    isl_chain = build_isl_chain(llm)
+    pipeline  = build_full_pipeline(nlp, isl_chain)
+
+    print("\nFull LangChain pipeline ready.")
+
     while True:
-        print("\n" + "─" * 40)
-        choice = input("Press ENTER to record, or type a Tamil sentence directly, or 'q' to quit: ").strip()
+        print("\n" + "─" * 45)
+        choice = input(
+            "Press ENTER to record | type Tamil text | 'q' to quit: "
+        ).strip()
 
         if choice.lower() == "q":
             print("Goodbye!")
             break
 
-        # ── Get Tamil text ──────────────────────
         if choice == "":
-            audio_path  = record_audio()
-            tamil_text  = speech_to_text(audio_path)
+            audio_path = record_audio()
+            tamil_text = speech_to_text(audio_path)
         else:
-            tamil_text = choice   # use typed input for testing
+            tamil_text = choice  
 
         if not tamil_text:
-            print("No text detected. Try again.")
+            print(" No text detected. Try again.")
             continue
 
-        # ── NLP pipeline ───────────────────────
-        tokens     = tokenize_and_tag(nlp, tamil_text)
-        isl_result = grammar_shift_to_isl(tokens, tamil_text)
+        try:
+            result = pipeline.invoke(tamil_text)
+            display_result(result)
+        except Exception as e:
+            print(f"Pipeline error: {e}")
 
-        # ── Show result ─────────────────────────
-        display_result(tamil_text, tokens, isl_result)
 
-
-# import requests
-#
-# def grammar_shift_to_isl_ollama(tokens, original_text):
-#     prompt = build_llm_prompt(tokens, original_text)
-#     resp = requests.post("http://localhost:11434/api/generate", json={
-#         "model": "mistral",
-#         "prompt": prompt,
-#         "stream": False,
-#     })
-#     raw = resp.json()["response"].strip()
-#     return json.loads(raw)
 # ──────────────────────────────────────────────
-
+# ALTERNATIVE: Swap OpenAI for Ollama (free/local)
+# ──────────────────────────────────────────────
+# from langchain_community.chat_models import ChatOllama
+#
+# llm = ChatOllama(model="mistral", temperature=0.2)
+#
+# Works identically — LangChain abstracts the provider.
+# Run: ollama pull mistral  →  ollama serve
+# ──────────────────────────────────────────────
 
 if __name__ == "__main__":
     main()
